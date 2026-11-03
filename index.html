@@ -1,11 +1,18 @@
-const SAVE_URL = 'https://web.archive.org/save/';
-const DELAY_MS = 10000;              // har save ke beech 10 sec
+// ===== Settings =====
+const GITHUB_ONLY = true;            // false karo to koi bhi public URL save hoga
+const SUBMIT_DELAY_MS = 4000;        // API keys ke saath har submit ke beech
+const NOKEY_DELAY_MS = 10000;        // bina keys ke har save ke beech
 const MAX_RUN_MS = 5 * 60 * 1000;    // Apps Script ki 6 min limit se pehle ruk jao
+
+// Columns: A URL | B Status | C Final snapshot link | D Saved at | E Job ID
 
 function onOpen() {
   SpreadsheetApp.getUi()
-    .createMenu('GitHub Wayback Saver')
-    .addItem('Save pending pages', 'savePending')
+    .createMenu('Wayback Bulk Saver')
+    .addItem('Step 1: Submit pending URLs', 'submitPending')
+    .addItem('Step 2: Get final links', 'getFinalLinks')
+    .addSeparator()
+    .addItem('Set API keys (recommended)', 'setKeys')
     .addItem('Add issues/pulls/wiki rows for repo links', 'expandRepos')
     .addItem('Setup headers', 'setupSheet')
     .addToUi();
@@ -13,24 +20,32 @@ function onOpen() {
 
 function setupSheet() {
   const sh = SpreadsheetApp.getActiveSheet();
-  sh.getRange(1, 1, 1, 4)
-    .setValues([['URL', 'Status', 'Snapshot link', 'Saved at']])
+  sh.getRange(1, 1, 1, 5)
+    .setValues([['URL', 'Status', 'Final snapshot link', 'Saved at', 'Job ID']])
     .setFontWeight('bold');
   sh.setFrozenRows(1);
   sh.setColumnWidth(1, 380);
-  sh.setColumnWidth(3, 380);
+  sh.setColumnWidth(3, 420);
 }
 
-// Sirf GitHub ke hosts allow: github.com, gist.github.com, raw.githubusercontent.com, *.github.io
-function isGithubUrl(url) {
-  const m = url.match(/^https?:\/\/([^\/?#:]+)/i);
-  if (!m) return false;
-  const host = m[1].toLowerCase();
-  return host === 'github.com' ||
-         host === 'www.github.com' ||
-         host === 'gist.github.com' ||
-         host === 'raw.githubusercontent.com' ||
-         /\.github\.io$/.test(host);
+// archive.org -> Account -> S3 keys (https://archive.org/account/s3.php)
+function setKeys() {
+  const ui = SpreadsheetApp.getUi();
+  const a = ui.prompt('Access key', 'archive.org S3 Access key paste karo:', ui.ButtonSet.OK_CANCEL);
+  if (a.getSelectedButton() !== ui.Button.OK) return;
+  const s = ui.prompt('Secret key', 'archive.org S3 Secret key paste karo:', ui.ButtonSet.OK_CANCEL);
+  if (s.getSelectedButton() !== ui.Button.OK) return;
+  const p = PropertiesService.getUserProperties();
+  p.setProperty('IA_ACCESS', a.getResponseText().trim());
+  p.setProperty('IA_SECRET', s.getResponseText().trim());
+  SpreadsheetApp.getActive().toast('Keys save ho gayi.', 'Wayback Bulk Saver', 5);
+}
+
+function getAuth() {
+  const p = PropertiesService.getUserProperties();
+  const a = p.getProperty('IA_ACCESS');
+  const s = p.getProperty('IA_SECRET');
+  return a && s ? 'LOW ' + a + ':' + s : '';
 }
 
 function normalizeUrl(raw) {
@@ -40,110 +55,167 @@ function normalizeUrl(raw) {
   return url;
 }
 
-// Repo link (github.com/user/repo) ke liye issues, pulls, releases, tags, wiki rows add karta hai
-function expandRepos() {
-  const ss = SpreadsheetApp.getActive();
-  const sh = SpreadsheetApp.getActiveSheet();
-  const last = sh.getLastRow();
-  if (last < 2) {
-    ss.toast('Column A mein row 2 se links daalo.', 'GitHub Wayback Saver', 6);
-    return;
-  }
-  const urls = sh.getRange(2, 1, last - 1, 1).getValues().map(r => normalizeUrl(r[0]));
-  const existing = {};
-  urls.forEach(u => { if (u) existing[u.replace(/\/$/, '')] = true; });
-
-  const extras = ['issues', 'pulls', 'releases', 'tags', 'wiki'];
-  const toAdd = [];
-  urls.forEach(u => {
-    const m = u.match(/^https?:\/\/(?:www\.)?github\.com\/([^\/?#]+)\/([^\/?#]+)\/?$/i);
-    if (!m) return;
-    const base = 'https://github.com/' + m[1] + '/' + m[2];
-    extras.forEach(e => {
-      const full = base + '/' + e;
-      if (!existing[full]) {
-        existing[full] = true;
-        toAdd.push([full]);
-      }
-    });
-  });
-
-  if (!toAdd.length) {
-    ss.toast('Koi naya repo page add nahi hua.', 'GitHub Wayback Saver', 6);
-    return;
-  }
-  sh.getRange(sh.getLastRow() + 1, 1, toAdd.length, 1).setValues(toAdd);
-  ss.toast(toAdd.length + ' rows add ho gayi.', 'GitHub Wayback Saver', 6);
+function isGithubUrl(url) {
+  const m = url.match(/^https?:\/\/([^\/?#:]+)/i);
+  if (!m) return false;
+  const host = m[1].toLowerCase();
+  return host === 'github.com' || host === 'www.github.com' ||
+         host === 'gist.github.com' || host === 'raw.githubusercontent.com' ||
+         /\.github\.io$/.test(host);
 }
 
-function savePending() {
+function now() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
+}
+
+// ===== Step 1: URLs submit karo =====
+function submitPending() {
   const ss = SpreadsheetApp.getActive();
   const sh = SpreadsheetApp.getActiveSheet();
   const last = sh.getLastRow();
   if (last < 2) {
-    ss.toast('Column A mein row 2 se GitHub links daalo.', 'GitHub Wayback Saver', 6);
+    ss.toast('Column A mein row 2 se links daalo.', 'Wayback Bulk Saver', 6);
     return;
   }
-
+  const auth = getAuth();
   const data = sh.getRange(2, 1, last - 1, 2).getValues();
   const start = Date.now();
-  let saved = 0, failed = 0, skipped = 0, stopReason = '';
+  let ok = 0, failed = 0, skipped = 0, stopReason = '';
 
   for (let i = 0; i < data.length; i++) {
     const row = i + 2;
     const url = normalizeUrl(data[i][0]);
     const status = String(data[i][1]).trim();
-    if (!url || status === 'Saved') continue;
+    if (!url || status === 'Saved' || status === 'Queued') continue;
 
-    if (!isGithubUrl(url)) {
+    if (GITHUB_ONLY && !isGithubUrl(url)) {
       sh.getRange(row, 2).setValue('Skipped: GitHub URL nahi hai');
       skipped++;
       continue;
     }
-
     if (Date.now() - start > MAX_RUN_MS) {
       stopReason = 'Time limit aa gayi, menu se dobara chalao.';
       break;
     }
 
-    sh.getRange(row, 2).setValue('Saving...');
-    SpreadsheetApp.flush();
-
-    const r = saveToWayback(url);
-    const when = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
-
-    if (r.ok) {
-      sh.getRange(row, 2, 1, 3).setValues([['Saved', r.link, when]]);
-      saved++;
-    } else {
-      sh.getRange(row, 2, 1, 3).setValues([['Failed: ' + r.msg, '', when]]);
-      failed++;
-      if (r.rateLimited) {
-        stopReason = 'Rate limit lag gayi. 2-3 minute ruk ke dobara chalao.';
-        break;
+    if (auth) {
+      const r = submitJob(url, auth);
+      if (r.ok) {
+        sh.getRange(row, 2, 1, 4).setValues([['Queued', '', now(), r.job]]);
+        ok++;
+      } else {
+        sh.getRange(row, 2, 1, 4).setValues([['Failed: ' + r.msg, '', now(), '']]);
+        failed++;
+        if (r.rateLimited) { stopReason = 'Rate limit. 2-3 minute ruk ke dobara chalao.'; break; }
       }
+      SpreadsheetApp.flush();
+      Utilities.sleep(SUBMIT_DELAY_MS);
+    } else {
+      sh.getRange(row, 2).setValue('Saving...');
+      SpreadsheetApp.flush();
+      const r = saveNoKey(url);
+      if (r.ok) {
+        sh.getRange(row, 2, 1, 3).setValues([['Saved', r.link, now()]]);
+        ok++;
+      } else {
+        sh.getRange(row, 2, 1, 3).setValues([['Failed: ' + r.msg, '', now()]]);
+        failed++;
+        if (r.rateLimited) { stopReason = 'Rate limit. 2-3 minute ruk ke dobara chalao.'; break; }
+      }
+      SpreadsheetApp.flush();
+      Utilities.sleep(NOKEY_DELAY_MS);
     }
-    SpreadsheetApp.flush();
-    Utilities.sleep(DELAY_MS);
   }
 
-  ss.toast(saved + ' saved, ' + failed + ' failed, ' + skipped + ' skipped. ' + stopReason,
-           'GitHub Wayback Saver', 10);
+  const next = auth ? ' Ab Step 2 chalao final links ke liye.' : '';
+  ss.toast(ok + ' done, ' + failed + ' failed, ' + skipped + ' skipped. ' + stopReason + next,
+           'Wayback Bulk Saver', 12);
 }
 
-function saveToWayback(url) {
+// SPN2 API: job submit
+function submitJob(url, auth) {
+  try {
+    const res = UrlFetchApp.fetch('https://web.archive.org/save', {
+      method: 'post',
+      muteHttpExceptions: true,
+      headers: { 'Accept': 'application/json', 'Authorization': auth },
+      payload: { url: url }
+    });
+    const code = res.getResponseCode();
+    if (code === 429) return { ok: false, msg: 'rate limited', rateLimited: true };
+    let json = {};
+    try { json = JSON.parse(res.getContentText()); } catch (e) {}
+    if (json.job_id) return { ok: true, job: json.job_id };
+    return { ok: false, msg: String(json.message || ('HTTP ' + code)).slice(0, 100) };
+  } catch (e) {
+    return { ok: false, msg: String(e).slice(0, 80) };
+  }
+}
+
+// ===== Step 2: final snapshot links lao =====
+function getFinalLinks() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = SpreadsheetApp.getActiveSheet();
+  const last = sh.getLastRow();
+  const auth = getAuth();
+  if (last < 2 || !auth) {
+    ss.toast('Pehle API keys set karo aur Step 1 chalao.', 'Wayback Bulk Saver', 6);
+    return;
+  }
+  const data = sh.getRange(2, 1, last - 1, 5).getValues();
+  const start = Date.now();
+  let done = 0, pending = 0, failed = 0, stopReason = '';
+
+  for (let i = 0; i < data.length; i++) {
+    const row = i + 2;
+    const status = String(data[i][1]).trim();
+    const job = String(data[i][4]).trim();
+    if (status !== 'Queued' || !job) continue;
+    if (Date.now() - start > MAX_RUN_MS) { stopReason = 'Time limit, dobara chalao.'; break; }
+
+    try {
+      const res = UrlFetchApp.fetch('https://web.archive.org/save/status/' + encodeURIComponent(job), {
+        muteHttpExceptions: true,
+        headers: { 'Accept': 'application/json', 'Authorization': auth }
+      });
+      const code = res.getResponseCode();
+      if (code === 429) { stopReason = 'Rate limit. Thodi der baad dobara chalao.'; break; }
+      const json = JSON.parse(res.getContentText());
+
+      if (json.status === 'success' && json.timestamp) {
+        const link = 'https://web.archive.org/web/' + json.timestamp + '/' + (json.original_url || data[i][0]);
+        sh.getRange(row, 2, 1, 3).setValues([['Saved', link, now()]]);
+        done++;
+      } else if (json.status === 'error') {
+        const msg = String(json.message || json.status_ext || 'error').slice(0, 100);
+        sh.getRange(row, 2, 1, 3).setValues([['Failed: ' + msg, '', now()]]);
+        failed++;
+      } else {
+        pending++;   // abhi chal raha hai
+      }
+    } catch (e) {
+      pending++;
+    }
+    Utilities.sleep(1000);
+  }
+
+  ss.toast(done + ' saved, ' + pending + ' abhi pending, ' + failed + ' failed. ' + stopReason +
+           (pending ? ' Pending ke liye 1-2 min baad Step 2 dobara chalao.' : ''),
+           'Wayback Bulk Saver', 12);
+}
+
+// ===== Bina keys wala tareeka (slow, kam reliable) =====
+function saveNoKey(url) {
   let lastMsg = '';
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const res = UrlFetchApp.fetch(SAVE_URL + url, {
+      const res = UrlFetchApp.fetch('https://web.archive.org/save/' + url, {
         muteHttpExceptions: true,
         followRedirects: true,
         headers: { 'User-Agent': 'Mozilla/5.0 (Google Apps Script)' }
       });
       const code = res.getResponseCode();
-
       if (code === 429) return { ok: false, msg: 'rate limited', rateLimited: true };
-
       if (code >= 200 && code < 300) {
         const headers = res.getHeaders();
         let loc = '';
@@ -154,10 +226,9 @@ function saveToWayback(url) {
         const snap = latestSnapshot(url);
         return { ok: true, link: snap || 'https://web.archive.org/web/*/' + url };
       }
-
       lastMsg = 'HTTP ' + code;
-      if (code < 500) break;          // 4xx par retry bekaar hai
-      Utilities.sleep(10000);         // 5xx par ek baar dobara
+      if (code < 500) break;
+      Utilities.sleep(10000);
     } catch (e) {
       lastMsg = String(e).slice(0, 80);
       Utilities.sleep(10000);
@@ -178,4 +249,28 @@ function latestSnapshot(url) {
   } catch (e) {
     return '';
   }
+}
+
+// Repo link (github.com/user/repo) ke liye issues, pulls, releases, tags, wiki rows add karta hai
+function expandRepos() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = SpreadsheetApp.getActiveSheet();
+  const last = sh.getLastRow();
+  if (last < 2) { ss.toast('Column A mein links daalo.', 'Wayback Bulk Saver', 6); return; }
+  const urls = sh.getRange(2, 1, last - 1, 1).getValues().map(r => normalizeUrl(r[0]));
+  const existing = {};
+  urls.forEach(u => { if (u) existing[u.replace(/\/$/, '')] = true; });
+  const toAdd = [];
+  urls.forEach(u => {
+    const m = u.match(/^https?:\/\/(?:www\.)?github\.com\/([^\/?#]+)\/([^\/?#]+)\/?$/i);
+    if (!m) return;
+    const base = 'https://github.com/' + m[1] + '/' + m[2];
+    ['issues', 'pulls', 'releases', 'tags', 'wiki'].forEach(e => {
+      const full = base + '/' + e;
+      if (!existing[full]) { existing[full] = true; toAdd.push([full]); }
+    });
+  });
+  if (!toAdd.length) { ss.toast('Koi naya repo page add nahi hua.', 'Wayback Bulk Saver', 6); return; }
+  sh.getRange(sh.getLastRow() + 1, 1, toAdd.length, 1).setValues(toAdd);
+  ss.toast(toAdd.length + ' rows add ho gayi.', 'Wayback Bulk Saver', 6);
 }
