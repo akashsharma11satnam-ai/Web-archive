@@ -1,34 +1,144 @@
-import sys
-import time
-import urllib.request
-import urllib.error
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web Archive – save any page</title>
+<style>
+  :root {
+    --bg: #eef1f4;
+    --surface: #ffffff;
+    --ink: #18222d;
+    --muted: #5b6875;
+    --line: #cdd5dd;
+    --accent: #1f5f8b;
+    --accent-ink: #ffffff;
+    --error: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12181e;
+      --surface: #1a232c;
+      --ink: #e6ebf0;
+      --muted: #97a4b1;
+      --line: #2e3b47;
+      --accent: #6db3e0;
+      --accent-ink: #0c1620;
+      --error: #f2a29c;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: Georgia, "Times New Roman", serif;
+    line-height: 1.6;
+    display: flex;
+    justify-content: center;
+    padding: 8vh 20px 40px;
+  }
+  main { width: 100%; max-width: 560px; }
+  h1 { font-size: 2rem; line-height: 1.2; margin: 0 0 8px; font-weight: 700; }
+  p.lead { margin: 0 0 28px; color: var(--muted); }
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 20px;
+  }
+  label { display: block; font-weight: 700; margin-bottom: 8px; }
+  input[type="text"] {
+    width: 100%;
+    font: 1rem/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  input[type="text"]:focus-visible,
+  button:focus-visible,
+  a:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+  button {
+    font: 600 1rem system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 11px 18px;
+    border-radius: 6px;
+    border: 1px solid var(--accent);
+    cursor: pointer;
+  }
+  .primary { background: var(--accent); color: var(--accent-ink); }
+  .secondary { background: transparent; color: var(--accent); }
+  #msg {
+    min-height: 1.5em;
+    margin: 12px 0 0;
+    font: 0.95rem system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: var(--error);
+  }
+  #msg.ok { color: var(--muted); }
+  .tips { margin-top: 24px; color: var(--muted); font-size: 0.95rem; }
+  .tips p { margin: 0 0 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Save a page to the Wayback Machine</h1>
+  <p class="lead">Paste a link. The Internet Archive will take a permanent snapshot of it.</p>
 
-def archive(url):
-    if "github.com" not in url:
-        sys.exit("Ye GitHub URL nahi hai.")
-    req = urllib.request.Request(
-        "https://web.archive.org/save/" + url,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
-    for attempt in range(3):
-        try:
-            with urllib.request.urlopen(req, timeout=120) as r:
-                loc = r.headers.get("Content-Location")
-                return "https://web.archive.org" + loc if loc else r.geturl()
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                print("Rate limit, 60 sec ruk raha hoon...")
-                time.sleep(60)
-            else:
-                print(f"HTTP {e.code}, dobara try...")
-                time.sleep(10)
-        except Exception as e:
-            print(f"Error: {e}, dobara try...")
-            time.sleep(10)
-    return None
+  <form class="panel" id="f" novalidate>
+    <label for="url">Page URL</label>
+    <input type="text" id="url" name="url" placeholder="https://example.com/page" autocomplete="off" autofocus>
+    <div class="actions">
+      <button type="submit" class="primary">Save page</button>
+      <button type="button" class="secondary" id="view">View saved copies</button>
+    </div>
+    <p id="msg" role="status" aria-live="polite"></p>
+  </form>
 
-if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit("Use: python gh_archive.py https://github.com/user/repo")
-    link = archive(sys.argv[1])
-    print("Saved:", link) if link else print("Save nahi ho paya.")
+  <div class="tips">
+    <p>The snapshot opens in a new tab. Saving can take up to a minute, so wait until it finishes.</p>
+    <p>Only public pages can be saved. Pages behind a login will not work.</p>
+  </div>
+</main>
+
+<script>
+  var form = document.getElementById("f");
+  var input = document.getElementById("url");
+  var msg = document.getElementById("msg");
+
+  function clean() {
+    var v = input.value.trim();
+    if (!v) return null;
+    if (!/^https?:\/\//i.test(v)) v = "https://" + v;
+    try {
+      var u = new URL(v);
+      if (!u.hostname.includes(".")) return null;
+      return u.href;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function show(text, ok) {
+    msg.textContent = text;
+    msg.className = ok ? "ok" : "";
+  }
+
+  form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    var url = clean();
+    if (!url) { show("Enter a valid link, for example https://example.com/page", false); return; }
+    window.open("https://web.archive.org/save/" + url, "_blank", "noopener");
+    show("Saving started in a new tab.", true);
+  });
+
+  document.getElementById("view").addEventListener("click", function () {
+    var url = clean();
+    if (!url) { show("Enter a valid link first.", false); return; }
+    window.open("https://web.archive.org/web/*/" + url, "_blank", "noopener");
+    show("Opened the list of saved copies.", true);
+  });
+</script>
+</body>
+</html>
