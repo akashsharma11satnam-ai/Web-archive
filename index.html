@@ -1,113 +1,34 @@
-const SAVE_URL = 'https://web.archive.org/save/';
-const DELAY_MS = 10000;             // har save ke beech 10 sec
-const MAX_RUN_MS = 5 * 60 * 1000;   // Apps Script ki 6 min limit se pehle ruk jao
+import sys
+import time
+import urllib.request
+import urllib.error
 
-function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu('Wayback Saver')
-    .addItem('Save pending pages', 'savePending')
-    .addItem('Setup headers', 'setupSheet')
-    .addToUi();
-}
+def archive(url):
+    if "github.com" not in url:
+        sys.exit("Ye GitHub URL nahi hai.")
+    req = urllib.request.Request(
+        "https://web.archive.org/save/" + url,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                loc = r.headers.get("Content-Location")
+                return "https://web.archive.org" + loc if loc else r.geturl()
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                print("Rate limit, 60 sec ruk raha hoon...")
+                time.sleep(60)
+            else:
+                print(f"HTTP {e.code}, dobara try...")
+                time.sleep(10)
+        except Exception as e:
+            print(f"Error: {e}, dobara try...")
+            time.sleep(10)
+    return None
 
-function setupSheet() {
-  const sh = SpreadsheetApp.getActiveSheet();
-  sh.getRange(1, 1, 1, 4)
-    .setValues([['URL', 'Status', 'Snapshot link', 'Saved at']])
-    .setFontWeight('bold');
-  sh.setFrozenRows(1);
-  sh.setColumnWidth(1, 380);
-  sh.setColumnWidth(3, 380);
-}
-
-function savePending() {
-  const ss = SpreadsheetApp.getActive();
-  const sh = SpreadsheetApp.getActiveSheet();
-  const last = sh.getLastRow();
-  if (last < 2) {
-    ss.toast('Column A mein row 2 se links daalo.', 'Wayback Saver', 6);
-    return;
-  }
-
-  const data = sh.getRange(2, 1, last - 1, 2).getValues();
-  const start = Date.now();
-  let saved = 0, failed = 0, stopReason = '';
-
-  for (let i = 0; i < data.length; i++) {
-    const row = i + 2;
-    let url = String(data[i][0]).trim();
-    const status = String(data[i][1]).trim();
-    if (!url || status === 'Saved') continue;
-
-    if (Date.now() - start > MAX_RUN_MS) {
-      stopReason = 'Time limit aa gayi, menu se dobara chalao.';
-      break;
-    }
-
-    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
-
-    sh.getRange(row, 2).setValue('Saving...');
-    SpreadsheetApp.flush();
-
-    const r = saveToWayback(url);
-    const when = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
-
-    if (r.ok) {
-      sh.getRange(row, 2, 1, 3).setValues([['Saved', r.link, when]]);
-      saved++;
-    } else {
-      sh.getRange(row, 2, 1, 3).setValues([['Failed: ' + r.msg, '', when]]);
-      failed++;
-      if (r.rateLimited) {
-        stopReason = 'Rate limit lag gayi. 2-3 minute ruk ke dobara chalao.';
-        break;
-      }
-    }
-    SpreadsheetApp.flush();
-    Utilities.sleep(DELAY_MS);
-  }
-
-  ss.toast(saved + ' saved, ' + failed + ' failed. ' + stopReason, 'Wayback Saver', 10);
-}
-
-function saveToWayback(url) {
-  try {
-    const res = UrlFetchApp.fetch(SAVE_URL + url, {
-      muteHttpExceptions: true,
-      followRedirects: true,
-      headers: { 'User-Agent': 'Mozilla/5.0 (Google Apps Script)' }
-    });
-    const code = res.getResponseCode();
-
-    if (code === 429) return { ok: false, msg: 'rate limited', rateLimited: true };
-
-    if (code >= 200 && code < 300) {
-      const headers = res.getHeaders();
-      let loc = '';
-      for (const k in headers) {
-        if (k.toLowerCase() === 'content-location') loc = headers[k];
-      }
-      if (loc) return { ok: true, link: 'https://web.archive.org' + loc };
-
-      const snap = latestSnapshot(url);
-      return { ok: true, link: snap || 'https://web.archive.org/web/*/' + url };
-    }
-    return { ok: false, msg: 'HTTP ' + code };
-  } catch (e) {
-    return { ok: false, msg: String(e).slice(0, 80) };
-  }
-}
-
-function latestSnapshot(url) {
-  try {
-    const res = UrlFetchApp.fetch(
-      'https://archive.org/wayback/available?url=' + encodeURIComponent(url),
-      { muteHttpExceptions: true }
-    );
-    const json = JSON.parse(res.getContentText());
-    const snap = json.archived_snapshots && json.archived_snapshots.closest;
-    return snap && snap.url ? snap.url.replace(/^http:/, 'https:') : '';
-  } catch (e) {
-    return '';
-  }
-}
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        sys.exit("Use: python gh_archive.py https://github.com/user/repo")
+    link = archive(sys.argv[1])
+    print("Saved:", link) if link else print("Save nahi ho paya.")
