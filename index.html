@@ -1,144 +1,181 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Web Archive – save any page</title>
-<style>
-  :root {
-    --bg: #eef1f4;
-    --surface: #ffffff;
-    --ink: #18222d;
-    --muted: #5b6875;
-    --line: #cdd5dd;
-    --accent: #1f5f8b;
-    --accent-ink: #ffffff;
-    --error: #b3261e;
+const SAVE_URL = 'https://web.archive.org/save/';
+const DELAY_MS = 10000;              // har save ke beech 10 sec
+const MAX_RUN_MS = 5 * 60 * 1000;    // Apps Script ki 6 min limit se pehle ruk jao
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('GitHub Wayback Saver')
+    .addItem('Save pending pages', 'savePending')
+    .addItem('Add issues/pulls/wiki rows for repo links', 'expandRepos')
+    .addItem('Setup headers', 'setupSheet')
+    .addToUi();
+}
+
+function setupSheet() {
+  const sh = SpreadsheetApp.getActiveSheet();
+  sh.getRange(1, 1, 1, 4)
+    .setValues([['URL', 'Status', 'Snapshot link', 'Saved at']])
+    .setFontWeight('bold');
+  sh.setFrozenRows(1);
+  sh.setColumnWidth(1, 380);
+  sh.setColumnWidth(3, 380);
+}
+
+// Sirf GitHub ke hosts allow: github.com, gist.github.com, raw.githubusercontent.com, *.github.io
+function isGithubUrl(url) {
+  const m = url.match(/^https?:\/\/([^\/?#:]+)/i);
+  if (!m) return false;
+  const host = m[1].toLowerCase();
+  return host === 'github.com' ||
+         host === 'www.github.com' ||
+         host === 'gist.github.com' ||
+         host === 'raw.githubusercontent.com' ||
+         /\.github\.io$/.test(host);
+}
+
+function normalizeUrl(raw) {
+  let url = String(raw).trim();
+  if (!url) return '';
+  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+  return url;
+}
+
+// Repo link (github.com/user/repo) ke liye issues, pulls, releases, tags, wiki rows add karta hai
+function expandRepos() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = SpreadsheetApp.getActiveSheet();
+  const last = sh.getLastRow();
+  if (last < 2) {
+    ss.toast('Column A mein row 2 se links daalo.', 'GitHub Wayback Saver', 6);
+    return;
   }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #12181e;
-      --surface: #1a232c;
-      --ink: #e6ebf0;
-      --muted: #97a4b1;
-      --line: #2e3b47;
-      --accent: #6db3e0;
-      --accent-ink: #0c1620;
-      --error: #f2a29c;
+  const urls = sh.getRange(2, 1, last - 1, 1).getValues().map(r => normalizeUrl(r[0]));
+  const existing = {};
+  urls.forEach(u => { if (u) existing[u.replace(/\/$/, '')] = true; });
+
+  const extras = ['issues', 'pulls', 'releases', 'tags', 'wiki'];
+  const toAdd = [];
+  urls.forEach(u => {
+    const m = u.match(/^https?:\/\/(?:www\.)?github\.com\/([^\/?#]+)\/([^\/?#]+)\/?$/i);
+    if (!m) return;
+    const base = 'https://github.com/' + m[1] + '/' + m[2];
+    extras.forEach(e => {
+      const full = base + '/' + e;
+      if (!existing[full]) {
+        existing[full] = true;
+        toAdd.push([full]);
+      }
+    });
+  });
+
+  if (!toAdd.length) {
+    ss.toast('Koi naya repo page add nahi hua.', 'GitHub Wayback Saver', 6);
+    return;
+  }
+  sh.getRange(sh.getLastRow() + 1, 1, toAdd.length, 1).setValues(toAdd);
+  ss.toast(toAdd.length + ' rows add ho gayi.', 'GitHub Wayback Saver', 6);
+}
+
+function savePending() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = SpreadsheetApp.getActiveSheet();
+  const last = sh.getLastRow();
+  if (last < 2) {
+    ss.toast('Column A mein row 2 se GitHub links daalo.', 'GitHub Wayback Saver', 6);
+    return;
+  }
+
+  const data = sh.getRange(2, 1, last - 1, 2).getValues();
+  const start = Date.now();
+  let saved = 0, failed = 0, skipped = 0, stopReason = '';
+
+  for (let i = 0; i < data.length; i++) {
+    const row = i + 2;
+    const url = normalizeUrl(data[i][0]);
+    const status = String(data[i][1]).trim();
+    if (!url || status === 'Saved') continue;
+
+    if (!isGithubUrl(url)) {
+      sh.getRange(row, 2).setValue('Skipped: GitHub URL nahi hai');
+      skipped++;
+      continue;
     }
-  }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; min-height: 100%; }
-  body {
-    background: var(--bg);
-    color: var(--ink);
-    font-family: Georgia, "Times New Roman", serif;
-    line-height: 1.6;
-    display: flex;
-    justify-content: center;
-    padding: 8vh 20px 40px;
-  }
-  main { width: 100%; max-width: 560px; }
-  h1 { font-size: 2rem; line-height: 1.2; margin: 0 0 8px; font-weight: 700; }
-  p.lead { margin: 0 0 28px; color: var(--muted); }
-  .panel {
-    background: var(--surface);
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 20px;
-  }
-  label { display: block; font-weight: 700; margin-bottom: 8px; }
-  input[type="text"] {
-    width: 100%;
-    font: 1rem/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
-    padding: 12px 14px;
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    background: var(--bg);
-    color: var(--ink);
-  }
-  input[type="text"]:focus-visible,
-  button:focus-visible,
-  a:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
-  .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
-  button {
-    font: 600 1rem system-ui, -apple-system, "Segoe UI", sans-serif;
-    padding: 11px 18px;
-    border-radius: 6px;
-    border: 1px solid var(--accent);
-    cursor: pointer;
-  }
-  .primary { background: var(--accent); color: var(--accent-ink); }
-  .secondary { background: transparent; color: var(--accent); }
-  #msg {
-    min-height: 1.5em;
-    margin: 12px 0 0;
-    font: 0.95rem system-ui, -apple-system, "Segoe UI", sans-serif;
-    color: var(--error);
-  }
-  #msg.ok { color: var(--muted); }
-  .tips { margin-top: 24px; color: var(--muted); font-size: 0.95rem; }
-  .tips p { margin: 0 0 8px; }
-</style>
-</head>
-<body>
-<main>
-  <h1>Save a page to the Wayback Machine</h1>
-  <p class="lead">Paste a link. The Internet Archive will take a permanent snapshot of it.</p>
 
-  <form class="panel" id="f" novalidate>
-    <label for="url">Page URL</label>
-    <input type="text" id="url" name="url" placeholder="https://example.com/page" autocomplete="off" autofocus>
-    <div class="actions">
-      <button type="submit" class="primary">Save page</button>
-      <button type="button" class="secondary" id="view">View saved copies</button>
-    </div>
-    <p id="msg" role="status" aria-live="polite"></p>
-  </form>
+    if (Date.now() - start > MAX_RUN_MS) {
+      stopReason = 'Time limit aa gayi, menu se dobara chalao.';
+      break;
+    }
 
-  <div class="tips">
-    <p>The snapshot opens in a new tab. Saving can take up to a minute, so wait until it finishes.</p>
-    <p>Only public pages can be saved. Pages behind a login will not work.</p>
-  </div>
-</main>
+    sh.getRange(row, 2).setValue('Saving...');
+    SpreadsheetApp.flush();
 
-<script>
-  var form = document.getElementById("f");
-  var input = document.getElementById("url");
-  var msg = document.getElementById("msg");
+    const r = saveToWayback(url);
+    const when = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
 
-  function clean() {
-    var v = input.value.trim();
-    if (!v) return null;
-    if (!/^https?:\/\//i.test(v)) v = "https://" + v;
+    if (r.ok) {
+      sh.getRange(row, 2, 1, 3).setValues([['Saved', r.link, when]]);
+      saved++;
+    } else {
+      sh.getRange(row, 2, 1, 3).setValues([['Failed: ' + r.msg, '', when]]);
+      failed++;
+      if (r.rateLimited) {
+        stopReason = 'Rate limit lag gayi. 2-3 minute ruk ke dobara chalao.';
+        break;
+      }
+    }
+    SpreadsheetApp.flush();
+    Utilities.sleep(DELAY_MS);
+  }
+
+  ss.toast(saved + ' saved, ' + failed + ' failed, ' + skipped + ' skipped. ' + stopReason,
+           'GitHub Wayback Saver', 10);
+}
+
+function saveToWayback(url) {
+  let lastMsg = '';
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      var u = new URL(v);
-      if (!u.hostname.includes(".")) return null;
-      return u.href;
+      const res = UrlFetchApp.fetch(SAVE_URL + url, {
+        muteHttpExceptions: true,
+        followRedirects: true,
+        headers: { 'User-Agent': 'Mozilla/5.0 (Google Apps Script)' }
+      });
+      const code = res.getResponseCode();
+
+      if (code === 429) return { ok: false, msg: 'rate limited', rateLimited: true };
+
+      if (code >= 200 && code < 300) {
+        const headers = res.getHeaders();
+        let loc = '';
+        for (const k in headers) {
+          if (k.toLowerCase() === 'content-location') loc = headers[k];
+        }
+        if (loc) return { ok: true, link: 'https://web.archive.org' + loc };
+        const snap = latestSnapshot(url);
+        return { ok: true, link: snap || 'https://web.archive.org/web/*/' + url };
+      }
+
+      lastMsg = 'HTTP ' + code;
+      if (code < 500) break;          // 4xx par retry bekaar hai
+      Utilities.sleep(10000);         // 5xx par ek baar dobara
     } catch (e) {
-      return null;
+      lastMsg = String(e).slice(0, 80);
+      Utilities.sleep(10000);
     }
   }
+  return { ok: false, msg: lastMsg };
+}
 
-  function show(text, ok) {
-    msg.textContent = text;
-    msg.className = ok ? "ok" : "";
+function latestSnapshot(url) {
+  try {
+    const res = UrlFetchApp.fetch(
+      'https://archive.org/wayback/available?url=' + encodeURIComponent(url),
+      { muteHttpExceptions: true }
+    );
+    const json = JSON.parse(res.getContentText());
+    const snap = json.archived_snapshots && json.archived_snapshots.closest;
+    return snap && snap.url ? snap.url.replace(/^http:/, 'https:') : '';
+  } catch (e) {
+    return '';
   }
-
-  form.addEventListener("submit", function (e) {
-    e.preventDefault();
-    var url = clean();
-    if (!url) { show("Enter a valid link, for example https://example.com/page", false); return; }
-    window.open("https://web.archive.org/save/" + url, "_blank", "noopener");
-    show("Saving started in a new tab.", true);
-  });
-
-  document.getElementById("view").addEventListener("click", function () {
-    var url = clean();
-    if (!url) { show("Enter a valid link first.", false); return; }
-    window.open("https://web.archive.org/web/*/" + url, "_blank", "noopener");
-    show("Opened the list of saved copies.", true);
-  });
-</script>
-</body>
-</html>
+}
